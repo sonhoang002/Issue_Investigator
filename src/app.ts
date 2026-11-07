@@ -2,6 +2,7 @@ import express, { type Request, type Response, type Express } from "express";
 import {
   getRepositorySummary,
   listRepositoryRoot,
+  readRepositoryFile,
   customError,
 } from "./github.js";
 
@@ -26,6 +27,32 @@ function checkParamsValidity(owner: unknown, repo: unknown) {
 
   return { owner, repo };
 }
+
+app.get(
+  "/api/repositories/:owner/:repo/file",
+  async (req: Request, res: Response) => {
+    try {
+      const { owner, repo } = checkParamsValidity(
+        req.params.owner,
+        req.params.repo,
+      );
+
+      if (typeof req.query.path !== "string" || req.query.path.length === 0) {
+        return res.status(400).json({ error: "INVALID_FILE_PATH" });
+      }
+
+      const response = await readRepositoryFile(owner, repo, req.query.path);
+
+      return res.status(200).json(response);
+    } catch (error) {
+      if (error instanceof customError) {
+        res.status(error.status).json({ error: error.message });
+      } else {
+        res.status(502).json({ error: "GITHUB_REQUEST_FAILED" });
+      }
+    }
+  },
+);
 
 app.get(
   "/api/repositories/:owner/:repo/contents",
