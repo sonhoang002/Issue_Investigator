@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { customError, getRepositorySummary, listRepositoryRoot, readRepositoryFile } from "./github.js";
+import { customError, getRepositorySummary, listRepositoryRoot, readRepositoryFile, listRepositoryFilePaths } from "./github.js";
 
 test("returns a valid repository summary", async (t) => {
   const metadata = {
@@ -70,6 +70,218 @@ function matchesClientError(status: number, message: string) {
   return (error: unknown) =>
     error instanceof customError && error.status === status && error.message === message;
 }
+
+// Minimal synthetic tree fixtures; only consumed fields are required.
+const treeFile = { path: "src/auth/login.ts", type: "blob", mode: "100644" };
+
+test("tree client returns the documented file paths with one request", async (t) => {
+  const fetchMock = t.mock.method(globalThis, "fetch", async () => Response.json({
+    truncated: false,
+    url: "https://example.invalid/do-not-follow",
+    tree: [
+      { path: "README.md", type: "blob", mode: "100644", size: 42 },
+      { path: "src", type: "tree", mode: "040000" },
+      treeFile,
+      { path: "scripts/check.sh", type: "blob", mode: "100755" },
+      { path: "current", type: "blob", mode: "120000" },
+      { path: "vendor/library", type: "commit", mode: "160000" },
+      { path: "README.md", type: "blob", mode: "100644" },
+    ],
+  }));
+  assert.deepEqual(await listRepositoryFilePaths("example-owner", "demo-repo", "main"),
+    ["README.md", "src/auth/login.ts", "scripts/check.sh"]);
+  assert.equal(fetchMock.mock.callCount(), 1);
+});
+
+test("tree client accepts empty trees and trees containing only skipped entry kinds", async (t) => {
+  let tree: unknown[] = [];
+  t.mock.method(globalThis, "fetch", async () => Response.json({ truncated: false, tree }));
+  assert.deepEqual(await listRepositoryFilePaths("owner", "repo", "main"), []);
+  tree = [
+    { path: "src", type: "tree", mode: "040000" },
+    { path: "link", type: "blob", mode: "120000" },
+    { path: "vendor/library", type: "commit", mode: "160000" },
+  ];
+  assert.deepEqual(await listRepositoryFilePaths("owner", "repo", "main"), []);
+});
+
+test("tree client preserves path spelling, order, and exact identity without a five-file cutoff", async (t) => {
+  const expected = ["z.ts", "Src/Login.ts", "src/login.ts", "docs/hello world.md", "src/登录.ts", "literal%2Fname", "archive.bin", ".config"];
+  const tree = [...expected, expected[0]!, expected[1]!].map((path) => ({ ...treeFile, path }));
+  t.mock.method(globalThis, "fetch", async () => Response.json({ truncated: false, tree }));
+  assert.deepEqual(await listRepositoryFilePaths("owner", "repo", "main"), expected);
+});
+
+test("tree client encodes separate URL components and supplies headers and fresh signals", async (t) => {
+  const requests: Array<{ url: string; options: RequestInit | undefined }> = [];
+  t.mock.method(globalThis, "fetch", async (input: Parameters<typeof fetch>[0], options?: RequestInit) => {
+    requests.push({ url: String(input), options });
+    return Response.json({ truncated: false, tree: [] });
+  });
+  // Bypass the future route boundary to inspect component escaping only.
+  await listRepositoryFilePaths("owner/space", "repo?#", "feature/login");
+  await listRepositoryFilePaths("owner", "repo", " main ");
+  assert.equal(requests.length, 2);
+  assert.equal(requests[0]!.url, "https://api.github.com/repos/owner%2Fspace/repo%3F%23/git/trees/feature%2Flogin?recursive=1");
+  assert.equal(requests[1]!.url, "https://api.github.com/repos/owner/repo/git/trees/%20main%20?recursive=1");
+  for (const { options } of requests) {
+    const headers = new Headers(options?.headers);
+    assert.equal(headers.get("Accept"), "application/vnd.github+json");
+    assert.equal(headers.get("User-Agent"), "issue-investigator");
+    assert.ok(options?.signal instanceof AbortSignal);
+    assert.equal(options.signal.aborted, false);
+    assert.ok(options.method === undefined || options.method === "GET");
+  }
+  assert.notEqual(requests[0]!.options?.signal, requests[1]!.options?.signal);
+});
+
+test("tree client rejects non-string or blank refs before fetching", async (t) => {
+  const fetchMock = t.mock.method(globalThis, "fetch", async () => Response.json({ truncated: false, tree: [] }));
+  for (const ref of [undefined, null, 1, false, [], {}, "", " \t\r\n"]) {
+    await assert.rejects(listRepositoryFilePaths("owner", "repo", ref as string),
+      matchesClientError(400, "INVALID_REPOSITORY_REF"));
+  }
+  assert.equal(fetchMock.mock.callCount(), 0);
+});
+
+test("tree client rejects malformed envelopes instead of assuming response types", async (t) => {
+  let body: unknown;
+  t.mock.method(globalThis, "fetch", async () => Response.json(body));
+  for (body of [null, [], "tree", 42, {}, { tree: [] }, { truncated: false },
+    { truncated: "false", tree: [] }, { truncated: 0, tree: [] },
+    { truncated: false, tree: null }, { truncated: false, tree: {} }]) {
+    await assert.rejects(listRepositoryFilePaths("owner", "repo", "main"),
+      matchesClientError(502, "GITHUB_REQUEST_FAILED"), JSON.stringify(body));
+  }
+});
+
+test("tree client rejects a truncated tree even when returned entries look valid", async (t) => {
+  t.mock.method(globalThis, "fetch", async () => Response.json({ truncated: true, tree: [treeFile] }));
+  await assert.rejects(listRepositoryFilePaths("owner", "repo", "main"),
+    matchesClientError(502, "REPOSITORY_TREE_TRUNCATED"));
+});
+
+test("tree client accepts exactly 10000 raw entries", async (t) => {
+  const paths = Array.from({ length: 10_000 }, (_, i) => `src/file-${i}.ts`);
+  const tree = paths.map((path) => ({ ...treeFile, path }));
+  t.mock.method(globalThis, "fetch", async () => Response.json({ truncated: false, tree }));
+  assert.deepEqual(await listRepositoryFilePaths("owner", "repo", "main"), paths);
+});
+
+test("tree client counts skipped and duplicate entries toward its raw limit", async (t) => {
+  const tree = Array.from({ length: 10_001 }, () => ({ path: "src", type: "tree", mode: "040000" }));
+  t.mock.method(globalThis, "fetch", async () => Response.json({ truncated: false, tree }));
+  await assert.rejects(listRepositoryFilePaths("owner", "repo", "main"),
+    matchesClientError(502, "REPOSITORY_TREE_TOO_LARGE"));
+});
+
+test("tree client checks truncation before the local entry limit", async (t) => {
+  t.mock.method(globalThis, "fetch", async () => Response.json({ truncated: true, tree: Array(10_001).fill(treeFile) }));
+  await assert.rejects(listRepositoryFilePaths("owner", "repo", "main"),
+    matchesClientError(502, "REPOSITORY_TREE_TRUNCATED"));
+});
+
+test("tree client rejects malformed entry fields anywhere in the response", async (t) => {
+  let invalid: unknown;
+  t.mock.method(globalThis, "fetch", async () => Response.json({ truncated: false, tree: [treeFile, invalid] }));
+  for (invalid of [null, [], "file", {}, { type: "blob", mode: "100644" },
+    { ...treeFile, path: "" }, { ...treeFile, path: 42 },
+    { path: "x", mode: "100644" }, { path: "x", type: "blob" },
+    { ...treeFile, type: 1 }, { ...treeFile, mode: 100644 }]) {
+    await assert.rejects(listRepositoryFilePaths("owner", "repo", "main"),
+      matchesClientError(502, "GITHUB_REQUEST_FAILED"), JSON.stringify(invalid));
+  }
+});
+
+test("tree client rejects unknown modes and every inconsistent known type/mode pair", async (t) => {
+  let entry = treeFile;
+  t.mock.method(globalThis, "fetch", async () => Response.json({ truncated: false, tree: [treeFile, entry] }));
+  const allowed = new Set(["blob:100644", "blob:100755", "blob:120000", "tree:040000", "commit:160000"]);
+  for (const type of ["blob", "tree", "commit", "file", "unknown"]) {
+    for (const mode of ["100644", "100755", "120000", "040000", "160000", "000000"]) {
+      if (allowed.has(`${type}:${mode}`)) continue;
+      entry = { path: "invalid", type, mode };
+      await assert.rejects(listRepositoryFilePaths("owner", "repo", "main"),
+        matchesClientError(502, "GITHUB_REQUEST_FAILED"), `${type}:${mode}`);
+    }
+  }
+});
+
+test("tree client validates paths for included files and skipped entry kinds alike", async (t) => {
+  let entry = treeFile;
+  t.mock.method(globalThis, "fetch", async () => Response.json({ truncated: false, tree: [treeFile, entry] }));
+  for (const [type, mode] of [["blob", "100644"], ["blob", "100755"], ["blob", "120000"], ["tree", "040000"], ["commit", "160000"]] as const) {
+    for (const path of ["", "/src/x", "src/", "src//x", ".", "..", "src/./x", "src/../x", "src\\x", "src/nu\0ll"]) {
+      entry = { path, type, mode };
+      await assert.rejects(listRepositoryFilePaths("owner", "repo", "main"),
+        matchesClientError(502, "GITHUB_REQUEST_FAILED"), JSON.stringify(entry));
+    }
+  }
+});
+
+test("tree client maps upstream 404 to repository-or-ref not found", async (t) => {
+  const fetchMock = t.mock.method(globalThis, "fetch", async () => new Response(null, { status: 404 }));
+  await assert.rejects(listRepositoryFilePaths("owner", "repo", "main"),
+    matchesClientError(404, "REPOSITORY_OR_REF_NOT_FOUND"));
+  assert.equal(fetchMock.mock.callCount(), 1);
+});
+
+test("tree client maps other unsuccessful statuses to the generic error without retries", async (t) => {
+  let status = 503;
+  const fetchMock = t.mock.method(globalThis, "fetch", async () => new Response(null, { status }));
+  for (status of [403, 409, 422, 429, 503]) {
+    await assert.rejects(listRepositoryFilePaths("owner", "repo", "main"), matchesClientError(502, "GITHUB_REQUEST_FAILED"));
+  }
+  assert.equal(fetchMock.mock.callCount(), 5);
+});
+
+test("tree client maps invalid JSON to the generic error", async (t) => {
+  t.mock.method(globalThis, "fetch", async () => new Response("{not json", { status: 200 }));
+  await assert.rejects(listRepositoryFilePaths("owner", "repo", "main"), matchesClientError(502, "GITHUB_REQUEST_FAILED"));
+});
+
+test("tree client maps network failures and recovers on a later independent call", async (t) => {
+  let fail = true;
+  const fetchMock = t.mock.method(globalThis, "fetch", async () => {
+    if (fail) throw new TypeError("Synthetic network failure");
+    return Response.json({ truncated: false, tree: [treeFile] });
+  });
+  await assert.rejects(listRepositoryFilePaths("owner", "repo", "main"), matchesClientError(502, "GITHUB_REQUEST_FAILED"));
+  fail = false;
+  assert.deepEqual(await listRepositoryFilePaths("owner", "repo", "main"), [treeFile.path]);
+  assert.equal(fetchMock.mock.callCount(), 2);
+});
+
+test("tree client requests a ten-second deadline, maps cancellation, and recovers with a fresh signal", async (t) => {
+  const originalTimeout = AbortSignal.timeout;
+  const timeoutMock = t.mock.method(AbortSignal, "timeout", (delay: number) => {
+    assert.equal(delay, 10_000);
+    return originalTimeout(20);
+  });
+  const signals: AbortSignal[] = [];
+  t.mock.method(globalThis, "fetch", async (_input: Parameters<typeof fetch>[0], options?: RequestInit) => {
+    assert.ok(options?.signal instanceof AbortSignal);
+    const signal = options.signal;
+    signals.push(signal);
+    if (signals.length > 1) return Response.json({ truncated: false, tree: [treeFile] });
+    return new Promise<Response>((_resolve, reject) => {
+      const watchdog = setTimeout(() => {
+        signal.removeEventListener("abort", onAbort);
+        reject(new Error("Expected test signal to abort"));
+      }, 1_000);
+      const onAbort = () => { clearTimeout(watchdog); reject(signal.reason); };
+      if (signal.aborted) onAbort();
+      else signal.addEventListener("abort", onAbort, { once: true });
+    });
+  });
+  await assert.rejects(listRepositoryFilePaths("owner", "repo", "main"), matchesClientError(502, "GITHUB_REQUEST_FAILED"));
+  assert.equal(signals[0]!.aborted, true);
+  assert.equal(signals[0]!.reason.name, "TimeoutError");
+  assert.deepEqual(await listRepositoryFilePaths("owner", "repo", "main"), [treeFile.path]);
+  assert.notEqual(signals[0], signals[1]);
+  assert.equal(signals[1]!.aborted, false);
+  assert.equal(timeoutMock.mock.callCount(), 2);
+});
 
 test("file reader decodes source and returns exactly four public fields", async (t) => {
   const fetchMock = t.mock.method(globalThis, "fetch", async () => Response.json({

@@ -49,6 +49,44 @@ type RepositoryFile = {
   content: string;
 };
 
+type GithubTreeEntry = {
+  path: string;
+  mode: string;
+  type: string;
+};
+
+type GithubGetATree = {
+  truncated: boolean;
+  tree: unknown[];
+};
+
+function isValidGithubTreeArray(data: unknown): data is GithubTreeEntry {
+  return (
+    typeof data === "object" &&
+    !Array.isArray(data) &&
+    data !== null &&
+    "path" in data &&
+    typeof data.path === "string" &&
+    data.path.length > 0 &&
+    "mode" in data &&
+    typeof data.mode === "string" &&
+    "type" in data &&
+    typeof data.type === "string"
+  );
+}
+
+function isValidGithubGetATree(data: unknown): data is GithubGetATree {
+  return (
+    typeof data === "object" &&
+    data !== null &&
+    !Array.isArray(data) &&
+    "truncated" in data &&
+    typeof data.truncated === "boolean" &&
+    "tree" in data &&
+    Array.isArray(data.tree)
+  );
+}
+
 function isValidGithubSummary(data: unknown): data is GitHubRepository {
   return (
     typeof data === "object" &&
@@ -300,6 +338,102 @@ export async function readRepositoryFile(
       sha: data.sha,
       content: text,
     };
+  } catch (error) {
+    if (error instanceof customError) {
+      throw error;
+    }
+
+    throw new customError(`GITHUB_REQUEST_FAILED`, 502);
+  }
+}
+
+export async function listRepositoryFilePaths(
+  owner: string,
+  repo: string,
+  ref: string,
+): Promise<string[]> {
+  try {
+    if (typeof ref !== "string" || ref.trim().length === 0) {
+      throw new customError("INVALID_REPOSITORY_REF", 400);
+    }
+
+    const response = await fetch(
+      `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/git/trees/${encodeURIComponent(ref)}?recursive=1`,
+      {
+        signal: AbortSignal.timeout(10_000),
+        headers: {
+          Accept: "application/vnd.github+json",
+          "User-Agent": "issue-investigator",
+        },
+      },
+    );
+
+    if (!response.ok) {
+      if (response.status === 404) {
+        throw new customError(`REPOSITORY_OR_REF_NOT_FOUND`, 404);
+      } else {
+        throw new customError(`GITHUB_REQUEST_FAILED`, 502);
+      }
+    }
+
+    const data: unknown = await response.json();
+
+    if (!isValidGithubGetATree(data)) {
+      throw new customError("GITHUB_REQUEST_FAILED", 502);
+    }
+
+    if (data.truncated) {
+      throw new customError("REPOSITORY_TREE_TRUNCATED", 502);
+    }
+
+    if (data.tree.length > 10_000) {
+      throw new customError("REPOSITORY_TREE_TOO_LARGE", 502);
+    }
+
+    const treeTypeModeMap = new Map<string, string[]>([
+      ["blob", ["100644", "100755", "120000"]],
+      ["tree", ["040000"]],
+      ["commit", ["160000"]],
+    ]);
+
+    let result: string[] = [];
+
+    for (const tree of data.tree) {
+      if (!isValidGithubTreeArray(tree)) {
+        throw new customError("GITHUB_REQUEST_FAILED", 502);
+      }
+
+      if (
+        !treeTypeModeMap.has(tree.type) ||
+        !treeTypeModeMap.get(tree.type)?.includes(tree.mode)
+      ) {
+        throw new customError("GITHUB_REQUEST_FAILED", 502);
+      }
+
+      const segments = tree.path.split("/");
+
+      for (const segment of segments) {
+        if (
+          segment === undefined ||
+          segment === "" ||
+          segment === "." ||
+          segment === ".." ||
+          segment.includes("\\") ||
+          segment.includes("\0")
+        ) {
+          throw new customError("GITHUB_REQUEST_FAILED", 502);
+        }
+      }
+
+      if (
+        tree.type === "blob" &&
+        (tree.mode === "100644" || tree.mode === "100755")
+      ) {
+        result.push(tree.path);
+      }
+    }
+
+    return [...new Set(result)];
   } catch (error) {
     if (error instanceof customError) {
       throw error;
