@@ -12,6 +12,245 @@ const metadata = {
   html_url: "https://github.com/example-owner/demo-repo",
 };
 
+const candidateRequest = { issueDescription: "Login fails when token expires", ref: "main" };
+const candidatePaths = ["src/auth/login.ts", "src/auth/token.ts", "src/auth/login-token.ts", "src/payments/checkout.ts", "README.md"];
+const candidateTree = {
+  truncated: false,
+  tree: candidatePaths.map((path) => ({ path, type: "blob", mode: "100644" })),
+};
+const candidateOutput = {
+  owner: "example-owner", repo: "demo-repo", ref: "main", candidateCount: 5,
+  files: [
+    { path: "src/auth/login-token.ts", score: 2, matchedTerms: ["login", "token"] },
+    { path: "src/auth/login.ts", score: 1, matchedTerms: ["login"] },
+    { path: "src/auth/token.ts", score: 1, matchedTerms: ["token"] },
+  ],
+};
+const candidateSuffix = "example-owner/demo-repo/candidates";
+const jsonHeaders = { "Content-Type": "application/json" };
+const candidatePost = { method: "POST", headers: jsonHeaders, body: JSON.stringify(candidateRequest) };
+
+test("candidates route composes one tree lookup with ranking and exact response fields", async (t) => {
+  const fetchMock = t.mock.method(globalThis, "fetch", async () => Response.json(candidateTree));
+  const request = await startServer(t);
+  const response = await request(candidateSuffix, candidatePost);
+  assert.equal(response.status, 200);
+  assert.deepEqual(response.body, candidateOutput);
+  assert.match(response.contentType ?? "", /application\/json/);
+  assert.equal(fetchMock.mock.callCount(), 1);
+  assert.equal(fetchMock.mock.calls[0]?.arguments[0], "https://api.github.com/repos/example-owner/demo-repo/git/trees/main?recursive=1");
+});
+
+test("candidates route counts unique eligible paths before filtering and the five-result cap", async (t) => {
+  const paths = ["z-login.ts", "b-login.ts", "a-login.ts", "c-login.ts", "d-login.ts", "e-login.ts", "z-login-token.ts", "unmatched.md"];
+  t.mock.method(globalThis, "fetch", async () => Response.json({ truncated: false, tree: [
+    ...paths.map((path) => ({ path, type: "blob", mode: "100644" })),
+    { path: "a-login.ts", type: "blob", mode: "100644" },
+    { path: "login-link", type: "blob", mode: "120000" },
+    { path: "login-dir", type: "tree", mode: "040000" },
+    { path: "login-submodule", type: "commit", mode: "160000" },
+  ] }));
+  const request = await startServer(t);
+  const response = await request(candidateSuffix, candidatePost);
+  assert.equal(response.status, 200);
+  assert.deepEqual(response.body, {
+    owner: "example-owner", repo: "demo-repo", ref: "main", candidateCount: 8,
+    files: [
+      { path: "z-login-token.ts", score: 2, matchedTerms: ["login", "token"] },
+      ...["a-login.ts", "b-login.ts", "c-login.ts", "d-login.ts"].map((path) => ({ path, score: 1, matchedTerms: ["login"] })),
+    ],
+  });
+});
+
+test("candidates route preserves identifier/ref spelling and encodes explicit refs once", async (t) => {
+  const fetchMock = t.mock.method(globalThis, "fetch", async () => Response.json({ truncated: false, tree: [] }));
+  const request = await startServer(t);
+  for (const [ref, encoded] of [["feature/login", "feature%2Flogin"], [" main ", "%20main%20"], ["literal%2Fref", "literal%252Fref"]]) {
+    const response = await request("Example-Owner/Demo.Repo/candidates", {
+      ...candidatePost, body: JSON.stringify({ ...candidateRequest, ref }),
+    });
+    assert.equal(response.status, 200);
+    assert.deepEqual(response.body, { owner: "Example-Owner", repo: "Demo.Repo", ref, candidateCount: 0, files: [] });
+    assert.equal(fetchMock.mock.calls.at(-1)?.arguments[0], `https://api.github.com/repos/Example-Owner/Demo.Repo/git/trees/${encoded}?recursive=1`);
+  }
+  assert.equal(fetchMock.mock.callCount(), 3);
+});
+
+test("candidates route returns successful empty results for empty or skipped-only trees", async (t) => {
+  let tree: unknown[] = [];
+  const fetchMock = t.mock.method(globalThis, "fetch", async () => Response.json({ truncated: false, tree }));
+  const request = await startServer(t);
+  for (tree of [[], [{ path: "link", type: "blob", mode: "120000" }]]) {
+    const response = await request(candidateSuffix, candidatePost);
+    assert.equal(response.status, 200);
+    assert.deepEqual(response.body, { ...candidateOutput, candidateCount: 0, files: [] });
+  }
+  assert.equal(fetchMock.mock.callCount(), 2);
+});
+
+test("candidates route still fetches once for nonmatching or termless valid reports", async (t) => {
+  const fetchMock = t.mock.method(globalThis, "fetch", async () => Response.json(candidateTree));
+  const request = await startServer(t);
+  for (const issueDescription of ["unrelated zebra", "the and for", "a ab !"]) {
+    const response = await request(candidateSuffix, { ...candidatePost, body: JSON.stringify({ ...candidateRequest, issueDescription }) });
+    assert.equal(response.status, 200);
+    assert.deepEqual(response.body, { ...candidateOutput, files: [] });
+  }
+  assert.equal(fetchMock.mock.callCount(), 3);
+});
+
+test("candidates route accepts trimmed length boundaries measured in UTF-16 units", async (t) => {
+  const fetchMock = t.mock.method(globalThis, "fetch", async () => Response.json(candidateTree));
+  const request = await startServer(t);
+  for (const issueDescription of [" x ", " \t" + "x".repeat(4_000) + "\n", "🙂".repeat(2_000)]) {
+    const response = await request(candidateSuffix, { ...candidatePost, body: JSON.stringify({ ...candidateRequest, issueDescription }) });
+    assert.equal(response.status, 200);
+    assert.deepEqual(response.body, { ...candidateOutput, files: [] });
+  }
+  assert.equal(fetchMock.mock.callCount(), 3);
+});
+
+test("candidates route trims the report and ignores additional body fields", async (t) => {
+  t.mock.method(globalThis, "fetch", async () => Response.json(candidateTree));
+  const request = await startServer(t);
+  const response = await request(candidateSuffix, {
+    ...candidatePost, body: JSON.stringify({ ...candidateRequest, issueDescription: `  ${candidateRequest.issueDescription}\n`, extra: { unused: true } }),
+  });
+  assert.equal(response.status, 200);
+  assert.deepEqual(response.body, candidateOutput);
+});
+
+test("candidates route rejects invalid repository identifiers before fetching", async (t) => {
+  const fetchMock = t.mock.method(globalThis, "fetch", async () => Response.json(candidateTree));
+  const request = await startServer(t);
+  for (const suffix of ["bad%20owner/demo-repo/candidates", "example-owner/bad%40repo/candidates", "bad%20owner/bad%40repo/candidates", "example-owner/./candidates", "example-owner/../candidates"]) {
+    const response = await request(suffix, candidatePost);
+    assert.equal(response.status, 400, suffix);
+    assert.deepEqual(response.body, { error: "INVALID_REPOSITORY_INPUT" });
+  }
+  assert.equal(fetchMock.mock.callCount(), 0);
+});
+
+test("candidates route rejects invalid JSON body shapes and fields without fetching", async (t) => {
+  const fetchMock = t.mock.method(globalThis, "fetch", async () => Response.json(candidateTree));
+  const request = await startServer(t);
+  const invalid: unknown[] = [null, [], "report", 123, false, {}, { ref: "main" }, { issueDescription: "login" }];
+  for (const issueDescription of [null, [], {}, 123, false, "", " \t\n", "x".repeat(4_001), "🙂".repeat(2_000) + "x"]) invalid.push({ ...candidateRequest, issueDescription });
+  for (const ref of [null, [], {}, 123, false, "", " \t\n"]) invalid.push({ ...candidateRequest, ref });
+  for (const body of invalid) {
+    const response = await request(candidateSuffix, { ...candidatePost, body: JSON.stringify(body) });
+    assert.equal(response.status, 400, JSON.stringify(body).slice(0, 80));
+    assert.deepEqual(response.body, { error: "INVALID_INVESTIGATION_INPUT" });
+  }
+  assert.equal(fetchMock.mock.callCount(), 0);
+});
+
+test("candidates route rejects absent bodies and unparsed media types without fetching", async (t) => {
+  const fetchMock = t.mock.method(globalThis, "fetch", async () => Response.json(candidateTree));
+  const request = await startServer(t);
+  for (const options of [
+    { method: "POST", headers: jsonHeaders },
+    { method: "POST", body: candidatePost.body },
+    { ...candidatePost, headers: { "Content-Type": "text/plain" } },
+  ]) {
+    const response = await request(candidateSuffix, options);
+    assert.equal(response.status, 400);
+    assert.deepEqual(response.body, { error: "INVALID_INVESTIGATION_INPUT" });
+  }
+  assert.equal(fetchMock.mock.callCount(), 0);
+});
+
+test("candidates parser accepts a body of exactly 16384 bytes", async (t) => {
+  const fetchMock = t.mock.method(globalThis, "fetch", async () => Response.json(candidateTree));
+  const request = await startServer(t);
+  const base = { ...candidateRequest, padding: "" };
+  const body = JSON.stringify({ ...base, padding: "x".repeat(16_384 - Buffer.byteLength(JSON.stringify(base))) });
+  assert.equal(Buffer.byteLength(body), 16_384);
+  const response = await request(candidateSuffix, { ...candidatePost, body });
+  assert.equal(response.status, 200);
+  assert.deepEqual(response.body, candidateOutput);
+  assert.equal(fetchMock.mock.callCount(), 1);
+});
+
+for (const { name, options, status, errorCode } of [
+  { name: "malformed JSON", options: { ...candidatePost, body: '{"issueDescription":' }, status: 400, errorCode: "INVALID_JSON" },
+  { name: "oversized body", options: { ...candidatePost, body: JSON.stringify({ ...candidateRequest, padding: "x".repeat(16_384) }) }, status: 413, errorCode: "REQUEST_BODY_TOO_LARGE" },
+  { name: "unsupported charset", options: { ...candidatePost, headers: { "Content-Type": "application/json; charset=bogus" } }, status: 415, errorCode: "UNSUPPORTED_BODY_ENCODING" },
+  { name: "unsupported encoding", options: { ...candidatePost, headers: { ...jsonHeaders, "Content-Encoding": "bogus" } }, status: 415, errorCode: "UNSUPPORTED_BODY_ENCODING" },
+  { name: "unexpected decompression error", options: { ...candidatePost, body: "not gzip", headers: { ...jsonHeaders, "Content-Encoding": "gzip" } }, status: 500, errorCode: "INTERNAL_SERVER_ERROR" },
+]) {
+  test(`candidates parser maps ${name} to exact JSON and recovers`, async (t) => {
+    const fetchMock = t.mock.method(globalThis, "fetch", async () => Response.json(candidateTree));
+    const request = await startServer(t);
+    const response = await request(candidateSuffix, options);
+    assert.equal(response.status, status);
+    assert.match(response.contentType ?? "", /application\/json/);
+    assert.equal(fetchMock.mock.callCount(), 0);
+    const recovery = await request(candidateSuffix, candidatePost);
+    assert.equal(recovery.status, 200);
+    assert.deepEqual(recovery.body, candidateOutput);
+    assert.equal(fetchMock.mock.callCount(), 1);
+    assert.deepEqual(response.body, { error: errorCode });
+  });
+}
+
+for (const { name, respond, status, errorCode } of [
+  { name: "missing repository/ref", respond: async () => new Response(null, { status: 404 }), status: 404, errorCode: "REPOSITORY_OR_REF_NOT_FOUND" },
+  { name: "upstream failure", respond: async () => new Response(null, { status: 503 }), status: 502, errorCode: "GITHUB_REQUEST_FAILED" },
+  { name: "malformed tree", respond: async () => Response.json({ truncated: false, tree: [...candidateTree.tree, null] }), status: 502, errorCode: "GITHUB_REQUEST_FAILED" },
+  { name: "truncated tree", respond: async () => Response.json({ ...candidateTree, truncated: true }), status: 502, errorCode: "REPOSITORY_TREE_TRUNCATED" },
+  { name: "oversized tree", respond: async () => Response.json({ truncated: false, tree: Array(10_001).fill(candidateTree.tree[0]) }), status: 502, errorCode: "REPOSITORY_TREE_TOO_LARGE" },
+  { name: "invalid upstream JSON", respond: async () => new Response("not JSON"), status: 502, errorCode: "GITHUB_REQUEST_FAILED" },
+  { name: "network failure", respond: async (): Promise<Response> => { throw new TypeError("Synthetic network error"); }, status: 502, errorCode: "GITHUB_REQUEST_FAILED" },
+]) {
+  test(`candidates route maps ${name} without partial results and recovers`, async (t) => {
+    let fail = true;
+    const fetchMock = t.mock.method(globalThis, "fetch", async () => fail ? respond() : Response.json(candidateTree));
+    const request = await startServer(t);
+    const response = await request(candidateSuffix, candidatePost);
+    assert.equal(response.status, status);
+    assert.deepEqual(response.body, { error: errorCode });
+    assert.equal(fetchMock.mock.callCount(), 1);
+    fail = false;
+    const recovery = await request(candidateSuffix, candidatePost);
+    assert.equal(recovery.status, 200);
+    assert.deepEqual(recovery.body, candidateOutput);
+    assert.equal(fetchMock.mock.callCount(), 2);
+  });
+}
+
+test("candidates route maps the requested ten-second deadline and recovers", async (t) => {
+  const originalTimeout = AbortSignal.timeout;
+  t.mock.method(AbortSignal, "timeout", (delay: number) => {
+    assert.equal(delay, 10_000);
+    return originalTimeout(20);
+  });
+  const signals: AbortSignal[] = [];
+  t.mock.method(globalThis, "fetch", async (_input: Parameters<typeof fetch>[0], options?: RequestInit) => {
+    assert.ok(options?.signal instanceof AbortSignal);
+    const signal = options.signal;
+    signals.push(signal);
+    if (signals.length > 1) return Response.json(candidateTree);
+    return new Promise<Response>((_resolve, reject) => {
+      const watchdog = setTimeout(() => { signal.removeEventListener("abort", onAbort); reject(new Error("Expected cancellation")); }, 1_000);
+      const onAbort = () => { clearTimeout(watchdog); reject(signal.reason); };
+      if (signal.aborted) onAbort();
+      else signal.addEventListener("abort", onAbort, { once: true });
+    });
+  });
+  const request = await startServer(t);
+  const response = await request(candidateSuffix, candidatePost);
+  assert.equal(response.status, 502);
+  assert.deepEqual(response.body, { error: "GITHUB_REQUEST_FAILED" });
+  assert.equal(signals[0]!.aborted, true);
+  assert.equal(signals[0]!.reason.name, "TimeoutError");
+  const recovery = await request(candidateSuffix, candidatePost);
+  assert.equal(recovery.status, 200);
+  assert.deepEqual(recovery.body, candidateOutput);
+  assert.notEqual(signals[0], signals[1]);
+  assert.equal(signals[1]!.aborted, false);
+});
+
 const rootEntries = [
   { name: "README.md", path: "README.md", type: "file" },
   { name: "src", path: "src", type: "dir" },
@@ -219,10 +458,10 @@ async function startServer(t: import("node:test").TestContext) {
   assert.ok(address && typeof address !== "string");
 
   // Raw HTTP preserves dot segments; the mocked global fetch is upstream only.
-  return (suffix: string) =>
+  return (suffix: string, options: { method?: string; body?: string; headers?: http.OutgoingHttpHeaders } = {}) =>
     new Promise<{ status: number | undefined; body: unknown; contentType: string | undefined }>((resolve, reject) => {
-      const request = http.get(
-        { hostname: "127.0.0.1", port: address.port, path: `/api/repositories/${suffix}` },
+      const request = http.request(
+        { hostname: "127.0.0.1", port: address.port, path: `/api/repositories/${suffix}`, method: options.method ?? "GET", ...(options.headers ? { headers: options.headers } : {}) },
         (response) => {
           let text = "";
           response.setEncoding("utf8");
@@ -238,6 +477,7 @@ async function startServer(t: import("node:test").TestContext) {
       );
       request.setTimeout(3_000, () => request.destroy(new Error("Local request timed out")));
       request.on("error", reject);
+      request.end(options.body);
     });
 }
 

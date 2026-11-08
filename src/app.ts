@@ -1,12 +1,53 @@
-import express, { type Request, type Response, type Express } from "express";
+import express, {
+  type Request,
+  type Response,
+  type Express,
+  type ErrorRequestHandler,
+  type NextFunction,
+} from "express";
 import {
   getRepositorySummary,
   listRepositoryRoot,
+  listRepositoryFilePaths,
   readRepositoryFile,
   customError,
 } from "./github.js";
 
+import { rankFilePaths } from "./retrieval.js";
+
 export const app: Express = express();
+
+const errorHandler: ErrorRequestHandler = (error: unknown, req, res, next) => {
+  const type =
+    typeof error === "object" &&
+    error !== null &&
+    "type" in error &&
+    typeof error.type === "string"
+      ? error.type
+      : undefined;
+  let statusCode: number = 500;
+  let message: string = "INTERNAL_SERVER_ERROR";
+
+  if (type === "entity.parse.failed") {
+    statusCode = 400;
+    message = "INVALID_JSON";
+  } else if (type === "entity.too.large") {
+    statusCode = 413;
+    message = "REQUEST_BODY_TOO_LARGE";
+  } else if (
+    type === "charset.unsupported" ||
+    type === "encoding.unsupported"
+  ) {
+    statusCode = 415;
+    message = "UNSUPPORTED_BODY_ENCODING";
+  }
+
+  if (res.headersSent) return next(error);
+
+  res.status(statusCode).json({
+    error: message,
+  });
+};
 
 function checkParamsValidity(owner: unknown, repo: unknown) {
   const ownerRegex = /^[a-zA-Z0-9-]+$/;
@@ -27,6 +68,66 @@ function checkParamsValidity(owner: unknown, repo: unknown) {
 
   return { owner, repo };
 }
+
+app.post(
+  "/api/repositories/:owner/:repo/candidates",
+  express.json({ limit: "16kb", strict: false }),
+  async (req: Request, res: Response) => {
+    try {
+      const { owner, repo } = checkParamsValidity(
+        req.params.owner,
+        req.params.repo,
+      );
+
+      const body: unknown = req.body;
+
+      if (
+        typeof body !== "object" ||
+        body === null ||
+        Array.isArray(body) ||
+        !("issueDescription" in body) ||
+        !("ref" in body)
+      ) {
+        return res.status(400).json({ error: "INVALID_INVESTIGATION_INPUT" });
+      }
+
+      if (
+        typeof body.issueDescription !== "string" ||
+        body.issueDescription.trim().length <= 0 ||
+        body.issueDescription.trim().length > 4_000
+      ) {
+        return res.status(400).json({ error: "INVALID_INVESTIGATION_INPUT" });
+      }
+
+      const ref = body.ref;
+
+      if (typeof ref !== "string" || ref.trim().length === 0) {
+        return res.status(400).json({ error: "INVALID_INVESTIGATION_INPUT" });
+      }
+
+      const filePaths = await listRepositoryFilePaths(owner, repo, ref);
+
+      const rankedFiles = rankFilePaths(
+        body.issueDescription.trim(),
+        filePaths,
+      );
+
+      return res.status(200).json({
+        owner: owner,
+        repo: repo,
+        ref: ref,
+        candidateCount: filePaths.length,
+        files: rankedFiles,
+      });
+    } catch (error) {
+      if (error instanceof customError) {
+        res.status(error.status).json({ error: error.message });
+      } else {
+        res.status(502).json({ error: "GITHUB_REQUEST_FAILED" });
+      }
+    }
+  },
+);
 
 app.get(
   "/api/repositories/:owner/:repo/file",
@@ -97,3 +198,5 @@ app.get(
     }
   },
 );
+
+app.use(errorHandler);
