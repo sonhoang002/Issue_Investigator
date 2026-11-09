@@ -142,7 +142,19 @@ app.get(
         return res.status(400).json({ error: "INVALID_FILE_PATH" });
       }
 
-      const response = await readRepositoryFile(owner, repo, req.query.path);
+      if (
+        req.query.ref !== undefined &&
+        (typeof req.query.ref !== "string" || req.query.ref.trim().length === 0)
+      ) {
+        return res.status(400).json({ error: "INVALID_REPOSITORY_REF" });
+      }
+
+      const response = await readRepositoryFile(
+        owner,
+        repo,
+        req.query.path,
+        req.query.ref,
+      );
 
       return res.status(200).json(response);
     } catch (error) {

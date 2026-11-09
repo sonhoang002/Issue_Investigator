@@ -272,6 +272,83 @@ const fileOutput = {
   content: "Hello, world!\n",
 };
 
+test("file route passes explicit refs with one-time query decoding and unchanged output", async (t) => {
+  const fetchMock = t.mock.method(globalThis, "fetch", async () => Response.json({ ...fileResponse, extra: "excluded" }));
+  const request = await startServer(t);
+  const cases = [
+    ["feature%2Flogin", "feature%2Flogin"],
+    ["%20main%20", "%20main%20"],
+    ["literal%252Fname", "literal%252Fname"],
+    ["branch%26other%3Dvalue%23fragment", "branch%26other%3Dvalue%23fragment"],
+    ["v1.2.3", "v1.2.3"],
+    ["a".repeat(40), "a".repeat(40)],
+  ];
+  for (const [query, expected] of cases) {
+    const response = await request(`example-owner/demo-repo/file?path=docs%2Fintro.md&ref=${query}`);
+    assert.equal(response.status, 200);
+    assert.deepEqual(response.body, fileOutput);
+    assert.match(response.contentType ?? "", /application\/json/);
+    assert.equal(fetchMock.mock.calls.at(-1)?.arguments[0], `https://api.github.com/repos/example-owner/demo-repo/contents/docs/intro.md?ref=${expected}`);
+  }
+  assert.equal(fetchMock.mock.callCount(), cases.length);
+});
+
+test("file route rejects blank and repeated refs with zero fetches and recovers", async (t) => {
+  const fetchMock = t.mock.method(globalThis, "fetch", async () => Response.json(fileResponse));
+  const request = await startServer(t);
+  for (const query of ["ref=", "ref=%20%09%0A", "ref=main&ref=other", "ref=main&ref=main"]) {
+    const response = await request(`example-owner/demo-repo/file?path=docs%2Fintro.md&${query}`);
+    assert.equal(response.status, 400, query);
+    assert.deepEqual(response.body, { error: "INVALID_REPOSITORY_REF" });
+    assert.equal(fetchMock.mock.callCount(), 0);
+  }
+  const recovery = await request("example-owner/demo-repo/file?path=docs%2Fintro.md&ref=feature%2Flogin");
+  assert.equal(recovery.status, 200);
+  assert.deepEqual(recovery.body, fileOutput);
+  assert.equal(fetchMock.mock.callCount(), 1);
+});
+
+test("file route retains owner and path validation before optional ref validation", async (t) => {
+  const fetchMock = t.mock.method(globalThis, "fetch", async () => Response.json(fileResponse));
+  const request = await startServer(t);
+  for (const [suffix, error] of [
+    ["bad%20owner/demo-repo/file?path=docs%2Fintro.md&ref=", "INVALID_REPOSITORY_INPUT"],
+    ["example-owner/demo-repo/file?ref=", "INVALID_FILE_PATH"],
+    ["example-owner/demo-repo/file?path=&ref=", "INVALID_FILE_PATH"],
+    ["example-owner/demo-repo/file?path=..%2Fintro.md&ref=main", "INVALID_FILE_PATH"],
+  ] as const) {
+    const response = await request(suffix);
+    assert.equal(response.status, 400);
+    assert.deepEqual(response.body, { error });
+  }
+  assert.equal(fetchMock.mock.callCount(), 0);
+});
+
+test("file route with ref preserves upstream error contracts and later recovery", async (t) => {
+  let respond: () => Promise<Response> = async () => Response.json(fileResponse);
+  const fetchMock = t.mock.method(globalThis, "fetch", async () => respond());
+  const request = await startServer(t);
+  const suffix = "example-owner/demo-repo/file?path=docs%2Fintro.md&ref=feature%2Flogin";
+  const cases = [
+    { reply: async () => new Response(null, { status: 404 }), status: 404, error: "FILE_NOT_FOUND" },
+    { reply: async () => new Response(null, { status: 503 }), status: 502, error: "GITHUB_REQUEST_FAILED" },
+    { reply: async () => Response.json({}), status: 502, error: "GITHUB_REQUEST_FAILED" },
+    { reply: async () => new Response("not JSON"), status: 502, error: "GITHUB_REQUEST_FAILED" },
+    { reply: async (): Promise<Response> => { throw new TypeError("Synthetic network failure"); }, status: 502, error: "GITHUB_REQUEST_FAILED" },
+  ];
+  for (const { reply, status, error } of cases) {
+    respond = reply;
+    const response = await request(suffix);
+    assert.equal(response.status, status);
+    assert.deepEqual(response.body, { error });
+    respond = async () => Response.json(fileResponse);
+    const recovery = await request(suffix);
+    assert.equal(recovery.status, 200);
+    assert.deepEqual(recovery.body, fileOutput);
+  }
+  assert.equal(fetchMock.mock.callCount(), cases.length * 2);
+});
+
 test("file route returns four fields and decoded text for a nested query path", async (t) => {
   const fetchMock = t.mock.method(globalThis, "fetch", async () => Response.json({ ...fileResponse, extra: "not returned" }));
   const request = await startServer(t);

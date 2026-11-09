@@ -264,6 +264,7 @@ export async function readRepositoryFile(
   owner: string,
   repo: string,
   filePath: string,
+  ref?: string,
 ): Promise<RepositoryFile> {
   try {
     if (typeof filePath !== "string" || filePath.length === 0) {
@@ -290,18 +291,27 @@ export async function readRepositoryFile(
       filePathArray[i] = encodeURIComponent(segment);
     }
 
+    if (
+      ref !== undefined &&
+      (typeof ref !== "string" || ref.trim().length === 0)
+    ) {
+      throw new customError("INVALID_REPOSITORY_REF", 400);
+    }
+
     const encodedFilePath = filePathArray.join("/");
 
-    const response = await fetch(
-      `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/contents/${encodedFilePath}`,
-      {
-        signal: AbortSignal.timeout(10_000),
-        headers: {
-          Accept: "application/vnd.github+json",
-          "User-Agent": "issue-investigator",
-        },
+    const baseUrl = `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/contents/${encodedFilePath}`;
+
+    const url =
+      ref === undefined ? baseUrl : `${baseUrl}?ref=${encodeURIComponent(ref)}`;
+
+    const response = await fetch(url, {
+      signal: AbortSignal.timeout(10_000),
+      headers: {
+        Accept: "application/vnd.github+json",
+        "User-Agent": "issue-investigator",
       },
-    );
+    });
 
     if (!response.ok) {
       if (response.status === 404) {

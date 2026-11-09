@@ -283,6 +283,120 @@ test("tree client requests a ten-second deadline, maps cancellation, and recover
   assert.equal(timeoutMock.mock.callCount(), 2);
 });
 
+test("file reader encodes optional ref values and preserves output, headers, and fresh signals", async (t) => {
+  const requests: Array<{ url: string; options: RequestInit | undefined }> = [];
+  t.mock.method(globalThis, "fetch", async (input: Parameters<typeof fetch>[0], options?: RequestInit) => {
+    requests.push({ url: String(input), options });
+    return Response.json({ ...fileFixture, extra: "excluded" });
+  });
+  const cases = [
+    ["feature/login", "feature%2Flogin"],
+    ["v1.2.3", "v1.2.3"],
+    ["a".repeat(40), "a".repeat(40)],
+    [" main ", "%20main%20"],
+    ["literal%2Fname", "literal%252Fname"],
+    ["feature&other=value#part?", "feature%26other%3Dvalue%23part%3F"],
+    ["功能/登录", "%E5%8A%9F%E8%83%BD%2F%E7%99%BB%E5%BD%95"],
+  ] as const;
+  for (const [ref, encoded] of cases) {
+    assert.deepEqual(await readRepositoryFile("example-owner", "demo-repo", "docs/intro.md", ref), {
+      name: "intro.md", path: "docs/intro.md", sha: "synthetic-blob-sha", content: "Hello, world!\n",
+    });
+    const last = requests.at(-1)!;
+    assert.equal(last.url, `https://api.github.com/repos/example-owner/demo-repo/contents/docs/intro.md?ref=${encoded}`);
+    const headers = new Headers(last.options?.headers);
+    assert.equal(headers.get("Accept"), "application/vnd.github+json");
+    assert.equal(headers.get("User-Agent"), "issue-investigator");
+    assert.ok(last.options?.signal instanceof AbortSignal);
+    assert.equal(last.options.signal.aborted, false);
+  }
+  assert.equal(requests.length, cases.length);
+  assert.equal(new Set(requests.map(({ options }) => options?.signal)).size, cases.length);
+});
+
+test("file reader treats omitted and explicit undefined refs identically", async (t) => {
+  const fetchMock = t.mock.method(globalThis, "fetch", async () => Response.json(fileFixture));
+  const omitted = await readRepositoryFile("example-owner", "demo-repo", "docs/intro.md");
+  const explicit = await readRepositoryFile("example-owner", "demo-repo", "docs/intro.md", undefined);
+  assert.deepEqual(explicit, omitted);
+  assert.equal(fetchMock.mock.callCount(), 2);
+  for (const call of fetchMock.mock.calls) {
+    assert.equal(call.arguments[0], "https://api.github.com/repos/example-owner/demo-repo/contents/docs/intro.md");
+  }
+});
+
+test("file reader rejects supplied invalid refs before fetching and accepts a later valid ref", async (t) => {
+  const fetchMock = t.mock.method(globalThis, "fetch", async () => Response.json(fileFixture));
+  for (const ref of [null, [], {}, 123, false, "", " \t\r\n"]) {
+    await assert.rejects(readRepositoryFile("owner", "repo", "docs/intro.md", ref as string),
+      matchesClientError(400, "INVALID_REPOSITORY_REF"));
+  }
+  assert.equal(fetchMock.mock.callCount(), 0);
+  assert.equal((await readRepositoryFile("owner", "repo", "docs/intro.md", "feature/login")).content, "Hello, world!\n");
+  assert.equal(fetchMock.mock.callCount(), 1);
+});
+
+test("file reader retains path rejection when a valid ref is supplied", async (t) => {
+  const fetchMock = t.mock.method(globalThis, "fetch", async () => Response.json(fileFixture));
+  for (const path of ["", "../intro.md", "docs//intro.md", "docs\\intro.md", "docs/nu\0ll"]) {
+    await assert.rejects(readRepositoryFile("owner", "repo", path, "feature/login"), matchesClientError(400, "INVALID_FILE_PATH"));
+  }
+  assert.equal(fetchMock.mock.callCount(), 0);
+});
+
+for (const { name, respond, status, message } of [
+  { name: "404", respond: async () => new Response(null, { status: 404 }), status: 404, message: "FILE_NOT_FOUND" },
+  { name: "503", respond: async () => new Response(null, { status: 503 }), status: 502, message: "GITHUB_REQUEST_FAILED" },
+  { name: "invalid JSON", respond: async () => new Response("not JSON"), status: 502, message: "GITHUB_REQUEST_FAILED" },
+  { name: "network failure", respond: async (): Promise<Response> => { throw new TypeError("Synthetic network failure"); }, status: 502, message: "GITHUB_REQUEST_FAILED" },
+]) {
+  test(`file reader with ref preserves ${name} error mapping without retrying`, async (t) => {
+    const fetchMock = t.mock.method(globalThis, "fetch", respond);
+    await assert.rejects(readRepositoryFile("owner", "repo", "docs/intro.md", "feature/login"), matchesClientError(status, message));
+    assert.equal(fetchMock.mock.callCount(), 1);
+  });
+}
+
+test("file reader with ref still validates file data, Base64, UTF-8, and decoded size", async (t) => {
+  let body: unknown;
+  t.mock.method(globalThis, "fetch", async () => Response.json(body));
+  for (body of [
+    {}, { ...fileFixture, content: "!!!!" },
+    { ...fileFixture, content: Buffer.from([0xff]).toString("base64"), size: 1 },
+    { ...fileFixture, size: fileFixture.size + 1 },
+    { ...fileFixture, type: "dir" },
+  ]) {
+    await assert.rejects(readRepositoryFile("owner", "repo", "docs/intro.md", "main"), matchesClientError(502, "GITHUB_REQUEST_FAILED"));
+  }
+});
+
+test("file reader with ref retains its requested deadline and recovers with a fresh signal", async (t) => {
+  const originalTimeout = AbortSignal.timeout;
+  t.mock.method(AbortSignal, "timeout", (delay: number) => {
+    assert.equal(delay, 10_000);
+    return originalTimeout(20);
+  });
+  const signals: AbortSignal[] = [];
+  t.mock.method(globalThis, "fetch", async (_input: Parameters<typeof fetch>[0], options?: RequestInit) => {
+    assert.ok(options?.signal instanceof AbortSignal);
+    const signal = options.signal;
+    signals.push(signal);
+    if (signals.length > 1) return Response.json(fileFixture);
+    return new Promise<Response>((_resolve, reject) => {
+      const watchdog = setTimeout(() => { signal.removeEventListener("abort", onAbort); reject(new Error("Expected cancellation")); }, 1_000);
+      const onAbort = () => { clearTimeout(watchdog); reject(signal.reason); };
+      if (signal.aborted) onAbort();
+      else signal.addEventListener("abort", onAbort, { once: true });
+    });
+  });
+  await assert.rejects(readRepositoryFile("owner", "repo", "docs/intro.md", "feature/login"), matchesClientError(502, "GITHUB_REQUEST_FAILED"));
+  assert.equal(signals[0]!.aborted, true);
+  assert.equal(signals[0]!.reason.name, "TimeoutError");
+  assert.equal((await readRepositoryFile("owner", "repo", "docs/intro.md", "feature/login")).content, "Hello, world!\n");
+  assert.notEqual(signals[0], signals[1]);
+  assert.equal(signals[1]!.aborted, false);
+});
+
 test("file reader decodes source and returns exactly four public fields", async (t) => {
   const fetchMock = t.mock.method(globalThis, "fetch", async () => Response.json({
     ...fileFixture,
