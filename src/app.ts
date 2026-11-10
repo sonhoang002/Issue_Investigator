@@ -14,10 +14,16 @@ import {
 } from "./github.js";
 
 import { rankFilePaths } from "./retrieval.js";
+import { collectRepositoryEvidence } from "./investigation.js";
 
 export const app: Express = express();
 
-const errorHandler: ErrorRequestHandler = (error: unknown, req, res, next) => {
+const errorHandler: ErrorRequestHandler = (
+  error: unknown,
+  req,
+  res,
+  next: NextFunction,
+) => {
   const type =
     typeof error === "object" &&
     error !== null &&
@@ -201,6 +207,60 @@ app.get(
       const response = await getRepositorySummary(owner, repo);
 
       res.status(200).json(response);
+    } catch (error) {
+      if (error instanceof customError) {
+        res.status(error.status).json({ error: error.message });
+      } else {
+        res.status(502).json({ error: "GITHUB_REQUEST_FAILED" });
+      }
+    }
+  },
+);
+
+app.post(
+  "/api/repositories/:owner/:repo/evidence",
+  express.json({ limit: "16kb", strict: false }),
+  async (req: Request, res: Response) => {
+    try {
+      const { owner, repo } = checkParamsValidity(
+        req.params.owner,
+        req.params.repo,
+      );
+
+      const body: unknown = req.body;
+
+      if (
+        typeof body !== "object" ||
+        body === null ||
+        Array.isArray(body) ||
+        !("issueDescription" in body) ||
+        !("ref" in body)
+      ) {
+        return res.status(400).json({ error: "INVALID_INVESTIGATION_INPUT" });
+      }
+
+      if (
+        typeof body.issueDescription !== "string" ||
+        body.issueDescription.trim().length <= 0 ||
+        body.issueDescription.trim().length > 4_000
+      ) {
+        return res.status(400).json({ error: "INVALID_INVESTIGATION_INPUT" });
+      }
+
+      const ref = body.ref;
+
+      if (typeof ref !== "string" || ref.trim().length === 0) {
+        return res.status(400).json({ error: "INVALID_INVESTIGATION_INPUT" });
+      }
+
+      const evidence = await collectRepositoryEvidence(
+        owner,
+        repo,
+        body.issueDescription.trim(),
+        ref,
+      );
+
+      return res.status(200).json(evidence);
     } catch (error) {
       if (error instanceof customError) {
         res.status(error.status).json({ error: error.message });

@@ -30,6 +30,241 @@ const candidateSuffix = "example-owner/demo-repo/candidates";
 const jsonHeaders = { "Content-Type": "application/json" };
 const candidatePost = { method: "POST", headers: jsonHeaders, body: JSON.stringify(candidateRequest) };
 
+const evidenceSuffix = "example-owner/demo/evidence";
+const evidenceInput = { issueDescription: "login token", ref: "main" };
+const evidencePost = { method: "POST", headers: jsonHeaders, body: JSON.stringify(evidenceInput) };
+const emptyEvidence = { owner: "example-owner", repo: "demo", ref: "main", candidateCount: 0, files: [] };
+
+function evidenceTree(paths: string[] = []) {
+  return Response.json({ truncated: false, tree: paths.map((path) => ({ path, type: "blob", mode: "100644" })) });
+}
+
+function evidenceFile(path: string, content = "export const login = true;") {
+  return Response.json({ type: "file", encoding: "base64", name: path.split("/").at(-1), path,
+    sha: "fixture-blob-sha", size: Buffer.byteLength(content), content: Buffer.from(content).toString("base64"),
+    html_url: "https://example.invalid/not-an-output-field" });
+}
+
+test("evidence route returns the exact documented bundle with one discovery and one read", async (t) => {
+  const urls: string[] = [];
+  t.mock.method(globalThis, "fetch", async (input: Parameters<typeof fetch>[0]) => {
+    urls.push(String(input));
+    return urls.length === 1 ? evidenceTree(["src/login.ts", "README.md"]) : evidenceFile("src/login.ts");
+  });
+  const request = await startServer(t);
+  const response = await request(evidenceSuffix, { ...evidencePost,
+    body: JSON.stringify({ ...evidenceInput, issueDescription: " \nlogin token\t", extra: "ignored" }) });
+  assert.equal(response.status, 200);
+  assert.match(response.contentType ?? "", /application\/json/);
+  assert.deepEqual(response.body, { ...emptyEvidence, candidateCount: 2,
+    files: [{ name: "login.ts", path: "src/login.ts", sha: "fixture-blob-sha",
+      content: "export const login = true;", score: 1, matchedTerms: ["login"] }] });
+  assert.deepEqual(urls, [
+    "https://api.github.com/repos/example-owner/demo/git/trees/main?recursive=1",
+    "https://api.github.com/repos/example-owner/demo/contents/src/login.ts?ref=main",
+  ]);
+});
+
+test("evidence route preserves ref and identifier spelling, ranking, counts, and three-read cap", async (t) => {
+  const ref = " feature/café%2F&draft#1 ";
+  const paths = ["z-login.ts", "c-login.ts", "b-login.ts", "a-login-token.ts", "README.md"];
+  const selected = ["a-login-token.ts", "b-login.ts", "c-login.ts"];
+  const urls: string[] = [];
+  const contents = ["café\n", "", "third"];
+  t.mock.method(globalThis, "fetch", async (input: Parameters<typeof fetch>[0]) => {
+    urls.push(String(input));
+    if (urls.length === 1) return evidenceTree(paths);
+    const index = urls.length - 2;
+    assert.ok(selected[index] !== undefined);
+    return evidenceFile(selected[index], contents[index]);
+  });
+  const request = await startServer(t);
+  const response = await request("Example-Owner/Demo.Repo/evidence", { ...evidencePost,
+    body: JSON.stringify({ ...evidenceInput, ref }) });
+  assert.equal(response.status, 200);
+  assert.deepEqual(response.body, { owner: "Example-Owner", repo: "Demo.Repo", ref, candidateCount: 5,
+    files: selected.map((path, index) => ({ name: path, path, sha: "fixture-blob-sha", content: contents[index],
+      score: index === 0 ? 2 : 1, matchedTerms: index === 0 ? ["login", "token"] : ["login"] })) });
+  const base = "https://api.github.com/repos/Example-Owner/Demo.Repo";
+  assert.deepEqual(urls, [`${base}/git/trees/${encodeURIComponent(ref)}?recursive=1`,
+    ...selected.map((path) => `${base}/contents/${path}?ref=${encodeURIComponent(ref)}`)]);
+});
+
+test("evidence route returns successful empty matches with exactly one discovery per request", async (t) => {
+  let paths: string[] = [];
+  const fetchMock = t.mock.method(globalThis, "fetch", async () => evidenceTree(paths));
+  const request = await startServer(t);
+  for (const scenario of [
+    { paths: [], description: "login token" },
+    { paths: ["README.md"], description: "login token" },
+    { paths: ["login.ts"], description: "the and x" },
+  ]) {
+    paths = scenario.paths;
+    const before = fetchMock.mock.callCount();
+    const response = await request(evidenceSuffix, { ...evidencePost,
+      body: JSON.stringify({ ...evidenceInput, issueDescription: scenario.description }) });
+    assert.equal(response.status, 200);
+    assert.deepEqual(response.body, { ...emptyEvidence, candidateCount: paths.length });
+    assert.equal(fetchMock.mock.callCount(), before + 1);
+  }
+});
+
+test("evidence route validates identifiers before body fields and never fetches rejected input", async (t) => {
+  const fetchMock = t.mock.method(globalThis, "fetch", async () => evidenceTree());
+  const request = await startServer(t);
+  for (const suffix of ["bad%20owner/demo/evidence", "example-owner/bad%40repo/evidence",
+    "example-owner/./evidence", "example-owner/../evidence"]) {
+    const response = await request(suffix, { ...evidencePost, body: "{}" });
+    assert.equal(response.status, 400);
+    assert.deepEqual(response.body, { error: "INVALID_REPOSITORY_INPUT" });
+  }
+  assert.equal(fetchMock.mock.callCount(), 0);
+});
+
+test("evidence route rejects malformed body shapes and invalid fields before upstream access", async (t) => {
+  const fetchMock = t.mock.method(globalThis, "fetch", async () => evidenceTree());
+  const request = await startServer(t);
+  const invalidBodies: unknown[] = [null, [], "text", 42, true, {}, { ref: "main" }, { issueDescription: "login" }];
+  for (const value of [null, [], {}, 42, false, "", " \n\t"]) {
+    invalidBodies.push({ ...evidenceInput, issueDescription: value }, { ...evidenceInput, ref: value });
+  }
+  invalidBodies.push({ ...evidenceInput, issueDescription: "x".repeat(4001) },
+    { ...evidenceInput, issueDescription: "😀".repeat(2001) });
+  for (const body of invalidBodies) {
+    const response = await request(evidenceSuffix, { ...evidencePost, body: JSON.stringify(body) });
+    assert.equal(response.status, 400);
+    assert.deepEqual(response.body, { error: "INVALID_INVESTIGATION_INPUT" });
+  }
+  assert.equal(fetchMock.mock.callCount(), 0);
+  const recovery = await request(evidenceSuffix, evidencePost);
+  assert.equal(recovery.status, 200);
+  assert.deepEqual(recovery.body, emptyEvidence);
+  assert.equal(fetchMock.mock.callCount(), 1);
+});
+
+test("evidence route accepts trimmed description boundaries measured in UTF-16 units", async (t) => {
+  const fetchMock = t.mock.method(globalThis, "fetch", async () => evidenceTree());
+  const request = await startServer(t);
+  for (const issueDescription of [" x ", ` ${"x".repeat(4000)}\n`, "😀".repeat(2000)]) {
+    const response = await request(evidenceSuffix, { ...evidencePost,
+      body: JSON.stringify({ ...evidenceInput, issueDescription }) });
+    assert.equal(response.status, 200);
+    assert.deepEqual(response.body, emptyEvidence);
+  }
+  assert.equal(fetchMock.mock.callCount(), 3);
+});
+
+test("evidence route rejects absent bodies and unparsed content types without fetching", async (t) => {
+  const fetchMock = t.mock.method(globalThis, "fetch", async () => evidenceTree());
+  const request = await startServer(t);
+  for (const options of [
+    { method: "POST" }, { method: "POST", headers: jsonHeaders },
+    { method: "POST", body: evidencePost.body },
+    { ...evidencePost, headers: { "Content-Type": "text/plain" } },
+    { ...evidencePost, headers: { "Content-Type": "application/x-www-form-urlencoded" } },
+  ]) {
+    const response = await request(evidenceSuffix, options);
+    assert.equal(response.status, 400);
+    assert.deepEqual(response.body, { error: "INVALID_INVESTIGATION_INPUT" });
+  }
+  assert.equal(fetchMock.mock.callCount(), 0);
+});
+
+test("evidence parser accepts exactly 16384 bytes and rejects one more byte", async (t) => {
+  const fetchMock = t.mock.method(globalThis, "fetch", async () => evidenceTree());
+  const request = await startServer(t);
+  const base = { ...evidenceInput, padding: "" };
+  for (const size of [16_384, 16_385]) {
+    const body = JSON.stringify({ ...base, padding: "x".repeat(size - Buffer.byteLength(JSON.stringify(base))) });
+    assert.equal(Buffer.byteLength(body), size);
+    const response = await request(evidenceSuffix, { ...evidencePost, body });
+    assert.equal(response.status, size === 16_384 ? 200 : 413);
+    assert.deepEqual(response.body, size === 16_384 ? emptyEvidence : { error: "REQUEST_BODY_TOO_LARGE" });
+    assert.equal(fetchMock.mock.callCount(), 1);
+  }
+});
+
+for (const { name, options, status, errorCode } of [
+  { name: "malformed JSON", options: { ...evidencePost, body: '{"issueDescription":' }, status: 400, errorCode: "INVALID_JSON" },
+  { name: "oversized body", options: { ...evidencePost, body: JSON.stringify({ ...evidenceInput, padding: "x".repeat(16_384) }) }, status: 413, errorCode: "REQUEST_BODY_TOO_LARGE" },
+  { name: "unsupported charset", options: { ...evidencePost, headers: { "Content-Type": "application/json; charset=bogus" } }, status: 415, errorCode: "UNSUPPORTED_BODY_ENCODING" },
+  { name: "unsupported encoding", options: { ...evidencePost, headers: { ...jsonHeaders, "Content-Encoding": "bogus" } }, status: 415, errorCode: "UNSUPPORTED_BODY_ENCODING" },
+  { name: "decompression failure", options: { ...evidencePost, body: "not gzip", headers: { ...jsonHeaders, "Content-Encoding": "gzip" } }, status: 500, errorCode: "INTERNAL_SERVER_ERROR" },
+]) {
+  test(`evidence parser maps ${name}, makes no upstream call, and recovers`, async (t) => {
+    const fetchMock = t.mock.method(globalThis, "fetch", async () => evidenceTree());
+    const request = await startServer(t);
+    const response = await request(evidenceSuffix, options);
+    assert.equal(response.status, status);
+    assert.deepEqual(response.body, { error: errorCode });
+    assert.match(response.contentType ?? "", /application\/json/);
+    assert.equal(fetchMock.mock.callCount(), 0);
+    const recovery = await request(evidenceSuffix, evidencePost);
+    assert.equal(recovery.status, 200);
+    assert.deepEqual(recovery.body, emptyEvidence);
+    assert.equal(fetchMock.mock.callCount(), 1);
+  });
+}
+
+for (const { name, respond, status, errorCode } of [
+  { name: "missing repository/ref", respond: () => new Response(null, { status: 404 }), status: 404, errorCode: "REPOSITORY_OR_REF_NOT_FOUND" },
+  { name: "upstream failure", respond: () => new Response(null, { status: 503 }), status: 502, errorCode: "GITHUB_REQUEST_FAILED" },
+  { name: "truncated tree", respond: () => Response.json({ truncated: true, tree: [] }), status: 502, errorCode: "REPOSITORY_TREE_TRUNCATED" },
+  { name: "oversized tree", respond: () => Response.json({ truncated: false, tree: Array(10_001).fill({ path: "login.ts", type: "blob", mode: "100644" }) }), status: 502, errorCode: "REPOSITORY_TREE_TOO_LARGE" },
+]) {
+  test(`evidence route propagates ${name} without file reads and recovers`, async (t) => {
+    let fail = true;
+    const fetchMock = t.mock.method(globalThis, "fetch", async () => fail ? respond() : evidenceTree());
+    const request = await startServer(t);
+    const response = await request(evidenceSuffix, evidencePost);
+    assert.equal(response.status, status);
+    assert.deepEqual(response.body, { error: errorCode });
+    assert.equal(fetchMock.mock.callCount(), 1);
+    fail = false;
+    const recovery = await request(evidenceSuffix, evidencePost);
+    assert.equal(recovery.status, 200);
+    assert.deepEqual(recovery.body, emptyEvidence);
+    assert.equal(fetchMock.mock.callCount(), 2);
+  });
+}
+
+for (const { name, respond, status, errorCode } of [
+  { name: "missing file", respond: async () => new Response(null, { status: 404 }), status: 404, errorCode: "FILE_NOT_FOUND" },
+  { name: "file upstream failure", respond: async () => new Response(null, { status: 503 }), status: 502, errorCode: "GITHUB_REQUEST_FAILED" },
+  { name: "malformed file", respond: async () => Response.json({}), status: 502, errorCode: "GITHUB_REQUEST_FAILED" },
+  { name: "file network failure", respond: async (): Promise<Response> => { throw new TypeError("Synthetic private upstream details"); }, status: 502, errorCode: "GITHUB_REQUEST_FAILED" },
+]) {
+  test(`evidence route rejects ${name} after a successful read without partial output and recovers`, async (t) => {
+    const urls: string[] = [];
+    let fail = true;
+    t.mock.method(globalThis, "fetch", async (input: Parameters<typeof fetch>[0]) => {
+      const url = String(input);
+      urls.push(url);
+      if (url.includes("/git/trees/")) return evidenceTree(["login-a.ts", "login-b.ts", "login-c.ts"]);
+      if (fail && url.includes("/contents/login-b.ts")) return respond();
+      const path = new URL(url).pathname.split("/contents/")[1];
+      assert.ok(path);
+      return evidenceFile(path);
+    });
+    const request = await startServer(t);
+    const response = await request(evidenceSuffix, evidencePost);
+    assert.equal(response.status, status);
+    assert.deepEqual(response.body, { error: errorCode });
+    assert.equal(urls.length, 3);
+    assert.ok(urls[1]?.includes("/contents/login-a.ts"));
+    assert.ok(urls[2]?.includes("/contents/login-b.ts"));
+    fail = false;
+    const recovery = await request(evidenceSuffix, evidencePost);
+    assert.equal(recovery.status, 200);
+    assert.deepEqual(recovery.body, { ...emptyEvidence, candidateCount: 3,
+      files: ["login-a.ts", "login-b.ts", "login-c.ts"].map((path) => ({
+        name: path, path, sha: "fixture-blob-sha", content: "export const login = true;",
+        score: 1, matchedTerms: ["login"],
+      })) });
+    assert.equal(urls.length, 7);
+  });
+}
+
 test("candidates route composes one tree lookup with ranking and exact response fields", async (t) => {
   const fetchMock = t.mock.method(globalThis, "fetch", async () => Response.json(candidateTree));
   const request = await startServer(t);
