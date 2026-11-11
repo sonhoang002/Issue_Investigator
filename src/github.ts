@@ -10,6 +10,19 @@ export class customError extends Error {
   }
 }
 
+export type ResolvedRepositoryRef = {
+  commitSha: string;
+  treeSha: string;
+};
+
+type GetACommitTree = {
+  sha: string;
+  commit: {
+    tree: {
+      sha: string;
+    };
+  };
+};
 type RepositorySummary = {
   name: string;
   fullName: string;
@@ -158,6 +171,29 @@ function isBase64File(data: unknown): boolean {
   }
 
   return true;
+}
+
+function isValidGetACommitTree(data: unknown): data is GetACommitTree {
+  const shaRegex = /^[a-fA-F0-9]{40}$/;
+  return (
+    typeof data === "object" &&
+    data !== null &&
+    !Array.isArray(data) &&
+    "sha" in data &&
+    typeof data.sha === "string" &&
+    shaRegex.test(data.sha) &&
+    "commit" in data &&
+    typeof data.commit === "object" &&
+    data.commit !== null &&
+    !Array.isArray(data.commit) &&
+    "tree" in data.commit &&
+    typeof data.commit.tree === "object" &&
+    data.commit.tree !== null &&
+    !Array.isArray(data.commit.tree) &&
+    "sha" in data.commit.tree &&
+    typeof data.commit.tree.sha === "string" &&
+    shaRegex.test(data.commit.tree.sha)
+  );
 }
 
 export async function getRepositorySummary(
@@ -450,5 +486,53 @@ export async function listRepositoryFilePaths(
     }
 
     throw new customError(`GITHUB_REQUEST_FAILED`, 502);
+  }
+}
+
+export async function resolveRepositoryRef(
+  owner: string,
+  repo: string,
+  ref: string,
+): Promise<ResolvedRepositoryRef> {
+  try {
+    if (typeof ref !== "string" || ref.trim().length == 0) {
+      throw new customError("INVALID_REPOSITORY_REF", 400);
+    }
+
+    const response = await fetch(
+      `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/commits/${encodeURIComponent(ref)}?per_page=1`,
+      {
+        signal: AbortSignal.timeout(10_000),
+        headers: {
+          Accept: "application/vnd.github+json",
+          "User-Agent": "issue-investigator",
+        },
+      },
+    );
+
+    if (!response.ok) {
+      if (response.status === 404) {
+        throw new customError(`REPOSITORY_OR_REF_NOT_FOUND`, 404);
+      } else {
+        throw new customError(`GITHUB_REQUEST_FAILED`, 502);
+      }
+    }
+
+    const data: unknown = await response.json();
+
+    if (!isValidGetACommitTree(data)) {
+      throw new customError("GITHUB_REQUEST_FAILED", 502);
+    }
+
+    return {
+      commitSha: data.sha,
+      treeSha: data.commit.tree.sha,
+    };
+  } catch (error) {
+    if (error instanceof customError) {
+      throw error;
+    }
+
+    throw new customError("GITHUB_REQUEST_FAILED", 502);
   }
 }

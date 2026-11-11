@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { customError, getRepositorySummary, listRepositoryRoot, readRepositoryFile, listRepositoryFilePaths } from "./github.js";
+import { customError, getRepositorySummary, listRepositoryRoot, readRepositoryFile, listRepositoryFilePaths, resolveRepositoryRef } from "./github.js";
 
 test("returns a valid repository summary", async (t) => {
   const metadata = {
@@ -70,6 +70,185 @@ function matchesClientError(status: number, message: string) {
   return (error: unknown) =>
     error instanceof customError && error.status === status && error.message === message;
 }
+
+const resolvedCommitSha = "1111111111111111111111111111111111111111";
+const resolvedTreeSha = "2222222222222222222222222222222222222222";
+const resolvedFixture = { sha: resolvedCommitSha, commit: { tree: { sha: resolvedTreeSha } } };
+const resolvedOutput = { commitSha: resolvedCommitSha, treeSha: resolvedTreeSha };
+
+test("ref resolver projects only commit and tree IDs without following diff pagination", async (t) => {
+  const fetchMock = t.mock.method(globalThis, "fetch", async () => Response.json({
+    ...resolvedFixture, files: [{ sha: "must-not-use-file-sha" }], parents: [{ sha: "must-not-use-parent" }],
+    html_url: "https://example.invalid/not-output",
+  }, { headers: { Link: '<https://example.invalid/do-not-follow>; rel="next"' } }));
+  assert.deepEqual(await resolveRepositoryRef("example-owner", "demo", "feature/login"), resolvedOutput);
+  assert.equal(fetchMock.mock.callCount(), 1);
+  assert.equal(fetchMock.mock.calls[0]?.arguments[0],
+    "https://api.github.com/repos/example-owner/demo/commits/feature%2Flogin?per_page=1");
+});
+
+test("ref resolver accepts minimal nested metadata and preserves hexadecimal case", async (t) => {
+  const sha = "aBcDeF0123".repeat(4);
+  const treeSha = "FEDCBA9876".repeat(4);
+  const fetchMock = t.mock.method(globalThis, "fetch", async () =>
+    Response.json({ sha, commit: { tree: { sha: treeSha } } }));
+  assert.deepEqual(await resolveRepositoryRef("example-owner", "demo", "main"), { commitSha: sha, treeSha });
+  assert.equal(fetchMock.mock.callCount(), 1);
+});
+
+test("ref resolver preserves and encodes refs once with headers and fresh signals even for SHA input", async (t) => {
+  const fetchMock = t.mock.method(globalThis, "fetch", async () => Response.json(resolvedFixture));
+  const refs = ["main", "tags/v1.2", " feature/café%2F&draft?#1 ", "a".repeat(40)];
+  const signals = new Set<AbortSignal>();
+  for (const ref of refs) {
+    assert.deepEqual(await resolveRepositoryRef("Example-Owner", "Demo.Repo", ref), resolvedOutput);
+    const call = fetchMock.mock.calls.at(-1);
+    assert.ok(call);
+    assert.equal(call.arguments[0],
+      `https://api.github.com/repos/Example-Owner/Demo.Repo/commits/${encodeURIComponent(ref)}?per_page=1`);
+    const options = call.arguments[1];
+    assert.ok(options);
+    assert.equal(options.method ?? "GET", "GET");
+    const headers = new Headers(options.headers);
+    assert.equal(headers.get("accept"), "application/vnd.github+json");
+    assert.equal(headers.get("user-agent"), "issue-investigator");
+    assert.ok(options.signal instanceof AbortSignal);
+    assert.equal(options.signal.aborted, false);
+    signals.add(options.signal);
+  }
+  assert.equal(fetchMock.mock.callCount(), refs.length);
+  assert.equal(signals.size, refs.length);
+});
+
+test("ref resolver rejects invalid refs before fetching and accepts a later valid ref", async (t) => {
+  const fetchMock = t.mock.method(globalThis, "fetch", async () => Response.json(resolvedFixture));
+  for (const ref of [undefined, null, 42, true, {}, [], "", " \t\n", "\u2003"]) {
+    // Deliberately bypass static typing to test the runtime guard.
+    await assert.rejects(resolveRepositoryRef("example-owner", "demo", ref as string),
+      matchesClientError(400, "INVALID_REPOSITORY_REF"));
+  }
+  assert.equal(fetchMock.mock.callCount(), 0);
+  assert.deepEqual(await resolveRepositoryRef("example-owner", "demo", "main"), resolvedOutput);
+  assert.equal(fetchMock.mock.callCount(), 1);
+});
+
+test("ref resolver rejects malformed containers at every required nesting level", async (t) => {
+  let payload: unknown;
+  const fetchMock = t.mock.method(globalThis, "fetch", async () => Response.json(payload));
+  const cases: unknown[] = [null, [], 42, true, "text", {}, { sha: resolvedCommitSha }];
+  for (const malformed of [null, [], 42, false, "text", {}]) {
+    cases.push({ sha: resolvedCommitSha, commit: malformed },
+      { sha: resolvedCommitSha, commit: { tree: malformed } });
+  }
+  for (const candidate of cases) {
+    payload = candidate;
+    await assert.rejects(resolveRepositoryRef("example-owner", "demo", "main"),
+      matchesClientError(502, "GITHUB_REQUEST_FAILED"), JSON.stringify(candidate));
+  }
+  assert.equal(fetchMock.mock.callCount(), cases.length);
+});
+
+for (const field of ["commit", "tree"] as const) {
+  test(`ref resolver rejects invalid ${field} SHA types, lengths, characters, and whitespace`, async (t) => {
+    let invalid: unknown;
+    const fetchMock = t.mock.method(globalThis, "fetch", async () => Response.json({
+      sha: field === "commit" ? invalid : resolvedCommitSha,
+      commit: { tree: { sha: field === "tree" ? invalid : resolvedTreeSha } },
+    }));
+    const values: unknown[] = [undefined, null, 42, {}, [], "", "a".repeat(39), "a".repeat(41),
+      "g".repeat(40), "a".repeat(39) + "-", " " + resolvedCommitSha, resolvedCommitSha + " ",
+      resolvedCommitSha + "\n", resolvedCommitSha + "\r\n", resolvedCommitSha + "\u2028",
+      "a".repeat(20) + "\n" + "b".repeat(19)];
+    for (const value of values) {
+      invalid = value;
+      await assert.rejects(resolveRepositoryRef("example-owner", "demo", "main"),
+        matchesClientError(502, "GITHUB_REQUEST_FAILED"), `Invalid ${field} SHA: ${JSON.stringify(value)}`);
+    }
+    assert.equal(fetchMock.mock.callCount(), values.length);
+  });
+}
+
+test("ref resolver maps 404 to repository-or-ref not found without retry", async (t) => {
+  const fetchMock = t.mock.method(globalThis, "fetch", async () => new Response(null, { status: 404 }));
+  await assert.rejects(resolveRepositoryRef("example-owner", "demo", "missing"),
+    matchesClientError(404, "REPOSITORY_OR_REF_NOT_FOUND"));
+  assert.equal(fetchMock.mock.callCount(), 1);
+});
+
+test("ref resolver maps other unsuccessful statuses to generic 502 without retry", async (t) => {
+  let status = 500;
+  const fetchMock = t.mock.method(globalThis, "fetch", async () =>
+    Response.json({ ...resolvedFixture, message: "Synthetic private upstream details" }, { status }));
+  for (const code of [400, 401, 403, 409, 422, 429, 500, 503]) {
+    status = code;
+    const before = fetchMock.mock.callCount();
+    await assert.rejects(resolveRepositoryRef("example-owner", "demo", "main"),
+      matchesClientError(502, "GITHUB_REQUEST_FAILED"));
+    assert.equal(fetchMock.mock.callCount(), before + 1);
+  }
+});
+
+test("ref resolver maps invalid JSON to generic 502", async (t) => {
+  const fetchMock = t.mock.method(globalThis, "fetch", async () => new Response("not JSON"));
+  await assert.rejects(resolveRepositoryRef("example-owner", "demo", "main"),
+    matchesClientError(502, "GITHUB_REQUEST_FAILED"));
+  assert.equal(fetchMock.mock.callCount(), 1);
+});
+
+test("ref resolver maps network failure and recovers on a later lookup", async (t) => {
+  let fail = true;
+  const fetchMock = t.mock.method(globalThis, "fetch", async () => {
+    if (fail) throw new TypeError("Synthetic network details");
+    return Response.json(resolvedFixture);
+  });
+  await assert.rejects(resolveRepositoryRef("example-owner", "demo", "main"),
+    matchesClientError(502, "GITHUB_REQUEST_FAILED"));
+  assert.equal(fetchMock.mock.callCount(), 1);
+  fail = false;
+  assert.deepEqual(await resolveRepositoryRef("example-owner", "demo", "main"), resolvedOutput);
+  assert.equal(fetchMock.mock.callCount(), 2);
+});
+
+test("ref resolver preserves recognized custom error identity", async (t) => {
+  const sentinel = new customError("SYNTHETIC_FAILURE", 502);
+  const fetchMock = t.mock.method(globalThis, "fetch", async () => { throw sentinel; });
+  await assert.rejects(resolveRepositoryRef("example-owner", "demo", "main"),
+    (error: unknown) => error === sentinel);
+  assert.equal(fetchMock.mock.callCount(), 1);
+});
+
+test("ref resolver requests a ten-second deadline, maps cancellation, and recovers", async (t) => {
+  const nativeTimeout = AbortSignal.timeout;
+  const timeoutMock = t.mock.method(AbortSignal, "timeout", (delay: number) => {
+    assert.equal(delay, 10_000);
+    return nativeTimeout(20);
+  });
+  const signals: AbortSignal[] = [];
+  const fetchMock = t.mock.method(globalThis, "fetch", async (_input: Parameters<typeof fetch>[0], options?: RequestInit) => {
+    assert.ok(options?.signal instanceof AbortSignal);
+    const signal = options.signal;
+    signals.push(signal);
+    if (signals.length > 1) return Response.json(resolvedFixture);
+    return new Promise<Response>((_resolve, reject) => {
+      const watchdog = setTimeout(() => {
+        signal.removeEventListener("abort", onAbort);
+        reject(new Error("Expected cancellation"));
+      }, 1_000);
+      const onAbort = () => { clearTimeout(watchdog); reject(signal.reason); };
+      if (signal.aborted) onAbort();
+      else signal.addEventListener("abort", onAbort, { once: true });
+    });
+  });
+  await assert.rejects(resolveRepositoryRef("example-owner", "demo", "main"),
+    matchesClientError(502, "GITHUB_REQUEST_FAILED"));
+  assert.equal(fetchMock.mock.callCount(), 1);
+  assert.equal(signals[0]?.aborted, true);
+  assert.deepEqual(await resolveRepositoryRef("example-owner", "demo", "main"), resolvedOutput);
+  assert.equal(signals[1]?.aborted, false);
+  assert.notEqual(signals[0], signals[1]);
+  assert.equal(fetchMock.mock.callCount(), 2);
+  assert.equal(timeoutMock.mock.callCount(), 2);
+});
 
 // Minimal synthetic tree fixtures; only consumed fields are required.
 const treeFile = { path: "src/auth/login.ts", type: "blob", mode: "100644" };
