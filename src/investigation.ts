@@ -1,6 +1,10 @@
-import { listRepositoryFilePaths, readRepositoryFile } from "./github.js";
+import {
+  listRepositoryFilePaths,
+  readRepositoryFile,
+  customError,
+  resolveRepositoryRef,
+} from "./github.js";
 import { rankFilePaths } from "./retrieval.js";
-import { customError } from "./github.js";
 
 export type EvidenceFile = {
   name: string;
@@ -17,6 +21,7 @@ export type EvidenceBundle = {
   ref: string;
   candidateCount: number;
   files: EvidenceFile[];
+  commitSha: string;
 };
 
 export async function collectRepositoryEvidence(
@@ -37,10 +42,12 @@ export async function collectRepositoryEvidence(
     throw new customError("INVALID_REPOSITORY_REF", 400);
   }
 
+  const repositoryRef = await resolveRepositoryRef(owner, repo, ref);
+
   const repoFilePaths: string[] = await listRepositoryFilePaths(
     owner,
     repo,
-    ref,
+    repositoryRef.treeSha,
   );
   const candidateCount: number = repoFilePaths.length;
 
@@ -50,7 +57,12 @@ export async function collectRepositoryEvidence(
   const files: EvidenceFile[] = [];
 
   for (const file of selectedRankedFile) {
-    const repoFiles = await readRepositoryFile(owner, repo, file.path, ref);
+    const repoFiles = await readRepositoryFile(
+      owner,
+      repo,
+      file.path,
+      repositoryRef.commitSha,
+    );
 
     files.push({
       name: repoFiles.name,
@@ -68,5 +80,6 @@ export async function collectRepositoryEvidence(
     ref,
     candidateCount,
     files,
+    commitSha: repositoryRef.commitSha,
   };
 }

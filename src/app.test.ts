@@ -33,7 +33,17 @@ const candidatePost = { method: "POST", headers: jsonHeaders, body: JSON.stringi
 const evidenceSuffix = "example-owner/demo/evidence";
 const evidenceInput = { issueDescription: "login token", ref: "main" };
 const evidencePost = { method: "POST", headers: jsonHeaders, body: JSON.stringify(evidenceInput) };
-const emptyEvidence = { owner: "example-owner", repo: "demo", ref: "main", candidateCount: 0, files: [] };
+const evidenceCommitSha = "1".repeat(40);
+const evidenceTreeSha = "2".repeat(40);
+const emptyEvidence = { owner: "example-owner", repo: "demo", ref: "main", commitSha: evidenceCommitSha, candidateCount: 0, files: [] };
+
+function evidenceResolution() {
+  return Response.json({ sha: evidenceCommitSha, commit: { tree: { sha: evidenceTreeSha } } });
+}
+
+async function emptyEvidenceResponse(input: Parameters<typeof fetch>[0]) {
+  return String(input).includes("/commits/") ? evidenceResolution() : evidenceTree();
+}
 
 function evidenceTree(paths: string[] = []) {
   return Response.json({ truncated: false, tree: paths.map((path) => ({ path, type: "blob", mode: "100644" })) });
@@ -45,11 +55,12 @@ function evidenceFile(path: string, content = "export const login = true;") {
     html_url: "https://example.invalid/not-an-output-field" });
 }
 
-test("evidence route returns the exact documented bundle with one discovery and one read", async (t) => {
+test("evidence route returns the exact pinned bundle with resolution, discovery, and one read", async (t) => {
   const urls: string[] = [];
   t.mock.method(globalThis, "fetch", async (input: Parameters<typeof fetch>[0]) => {
     urls.push(String(input));
-    return urls.length === 1 ? evidenceTree(["src/login.ts", "README.md"]) : evidenceFile("src/login.ts");
+    if (urls.length === 1) return evidenceResolution();
+    return urls.length === 2 ? evidenceTree(["src/login.ts", "README.md"]) : evidenceFile("src/login.ts");
   });
   const request = await startServer(t);
   const response = await request(evidenceSuffix, { ...evidencePost,
@@ -60,8 +71,9 @@ test("evidence route returns the exact documented bundle with one discovery and 
     files: [{ name: "login.ts", path: "src/login.ts", sha: "fixture-blob-sha",
       content: "export const login = true;", score: 1, matchedTerms: ["login"] }] });
   assert.deepEqual(urls, [
-    "https://api.github.com/repos/example-owner/demo/git/trees/main?recursive=1",
-    "https://api.github.com/repos/example-owner/demo/contents/src/login.ts?ref=main",
+    "https://api.github.com/repos/example-owner/demo/commits/main?per_page=1",
+    `https://api.github.com/repos/example-owner/demo/git/trees/${evidenceTreeSha}?recursive=1`,
+    `https://api.github.com/repos/example-owner/demo/contents/src/login.ts?ref=${evidenceCommitSha}`,
   ]);
 });
 
@@ -73,8 +85,9 @@ test("evidence route preserves ref and identifier spelling, ranking, counts, and
   const contents = ["café\n", "", "third"];
   t.mock.method(globalThis, "fetch", async (input: Parameters<typeof fetch>[0]) => {
     urls.push(String(input));
-    if (urls.length === 1) return evidenceTree(paths);
-    const index = urls.length - 2;
+    if (urls.length === 1) return evidenceResolution();
+    if (urls.length === 2) return evidenceTree(paths);
+    const index = urls.length - 3;
     assert.ok(selected[index] !== undefined);
     return evidenceFile(selected[index], contents[index]);
   });
@@ -82,17 +95,19 @@ test("evidence route preserves ref and identifier spelling, ranking, counts, and
   const response = await request("Example-Owner/Demo.Repo/evidence", { ...evidencePost,
     body: JSON.stringify({ ...evidenceInput, ref }) });
   assert.equal(response.status, 200);
-  assert.deepEqual(response.body, { owner: "Example-Owner", repo: "Demo.Repo", ref, candidateCount: 5,
+  assert.deepEqual(response.body, { owner: "Example-Owner", repo: "Demo.Repo", ref, commitSha: evidenceCommitSha, candidateCount: 5,
     files: selected.map((path, index) => ({ name: path, path, sha: "fixture-blob-sha", content: contents[index],
       score: index === 0 ? 2 : 1, matchedTerms: index === 0 ? ["login", "token"] : ["login"] })) });
   const base = "https://api.github.com/repos/Example-Owner/Demo.Repo";
-  assert.deepEqual(urls, [`${base}/git/trees/${encodeURIComponent(ref)}?recursive=1`,
-    ...selected.map((path) => `${base}/contents/${path}?ref=${encodeURIComponent(ref)}`)]);
+  assert.deepEqual(urls, [`${base}/commits/${encodeURIComponent(ref)}?per_page=1`,
+    `${base}/git/trees/${evidenceTreeSha}?recursive=1`,
+    ...selected.map((path) => `${base}/contents/${path}?ref=${evidenceCommitSha}`)]);
 });
 
-test("evidence route returns successful empty matches with exactly one discovery per request", async (t) => {
+test("evidence route returns pinned empty matches with one resolution and one discovery per request", async (t) => {
   let paths: string[] = [];
-  const fetchMock = t.mock.method(globalThis, "fetch", async () => evidenceTree(paths));
+  const fetchMock = t.mock.method(globalThis, "fetch", async (input: Parameters<typeof fetch>[0]) =>
+    String(input).includes("/commits/") ? evidenceResolution() : evidenceTree(paths));
   const request = await startServer(t);
   for (const scenario of [
     { paths: [], description: "login token" },
@@ -105,7 +120,7 @@ test("evidence route returns successful empty matches with exactly one discovery
       body: JSON.stringify({ ...evidenceInput, issueDescription: scenario.description }) });
     assert.equal(response.status, 200);
     assert.deepEqual(response.body, { ...emptyEvidence, candidateCount: paths.length });
-    assert.equal(fetchMock.mock.callCount(), before + 1);
+    assert.equal(fetchMock.mock.callCount(), before + 2);
   }
 });
 
@@ -122,7 +137,7 @@ test("evidence route validates identifiers before body fields and never fetches 
 });
 
 test("evidence route rejects malformed body shapes and invalid fields before upstream access", async (t) => {
-  const fetchMock = t.mock.method(globalThis, "fetch", async () => evidenceTree());
+  const fetchMock = t.mock.method(globalThis, "fetch", emptyEvidenceResponse);
   const request = await startServer(t);
   const invalidBodies: unknown[] = [null, [], "text", 42, true, {}, { ref: "main" }, { issueDescription: "login" }];
   for (const value of [null, [], {}, 42, false, "", " \n\t"]) {
@@ -139,11 +154,11 @@ test("evidence route rejects malformed body shapes and invalid fields before ups
   const recovery = await request(evidenceSuffix, evidencePost);
   assert.equal(recovery.status, 200);
   assert.deepEqual(recovery.body, emptyEvidence);
-  assert.equal(fetchMock.mock.callCount(), 1);
+  assert.equal(fetchMock.mock.callCount(), 2);
 });
 
 test("evidence route accepts trimmed description boundaries measured in UTF-16 units", async (t) => {
-  const fetchMock = t.mock.method(globalThis, "fetch", async () => evidenceTree());
+  const fetchMock = t.mock.method(globalThis, "fetch", emptyEvidenceResponse);
   const request = await startServer(t);
   for (const issueDescription of [" x ", ` ${"x".repeat(4000)}\n`, "😀".repeat(2000)]) {
     const response = await request(evidenceSuffix, { ...evidencePost,
@@ -151,7 +166,7 @@ test("evidence route accepts trimmed description boundaries measured in UTF-16 u
     assert.equal(response.status, 200);
     assert.deepEqual(response.body, emptyEvidence);
   }
-  assert.equal(fetchMock.mock.callCount(), 3);
+  assert.equal(fetchMock.mock.callCount(), 6);
 });
 
 test("evidence route rejects absent bodies and unparsed content types without fetching", async (t) => {
@@ -171,7 +186,7 @@ test("evidence route rejects absent bodies and unparsed content types without fe
 });
 
 test("evidence parser accepts exactly 16384 bytes and rejects one more byte", async (t) => {
-  const fetchMock = t.mock.method(globalThis, "fetch", async () => evidenceTree());
+  const fetchMock = t.mock.method(globalThis, "fetch", emptyEvidenceResponse);
   const request = await startServer(t);
   const base = { ...evidenceInput, padding: "" };
   for (const size of [16_384, 16_385]) {
@@ -180,7 +195,7 @@ test("evidence parser accepts exactly 16384 bytes and rejects one more byte", as
     const response = await request(evidenceSuffix, { ...evidencePost, body });
     assert.equal(response.status, size === 16_384 ? 200 : 413);
     assert.deepEqual(response.body, size === 16_384 ? emptyEvidence : { error: "REQUEST_BODY_TOO_LARGE" });
-    assert.equal(fetchMock.mock.callCount(), 1);
+    assert.equal(fetchMock.mock.callCount(), 2);
   }
 });
 
@@ -192,7 +207,7 @@ for (const { name, options, status, errorCode } of [
   { name: "decompression failure", options: { ...evidencePost, body: "not gzip", headers: { ...jsonHeaders, "Content-Encoding": "gzip" } }, status: 500, errorCode: "INTERNAL_SERVER_ERROR" },
 ]) {
   test(`evidence parser maps ${name}, makes no upstream call, and recovers`, async (t) => {
-    const fetchMock = t.mock.method(globalThis, "fetch", async () => evidenceTree());
+    const fetchMock = t.mock.method(globalThis, "fetch", emptyEvidenceResponse);
     const request = await startServer(t);
     const response = await request(evidenceSuffix, options);
     assert.equal(response.status, status);
@@ -202,7 +217,7 @@ for (const { name, options, status, errorCode } of [
     const recovery = await request(evidenceSuffix, evidencePost);
     assert.equal(recovery.status, 200);
     assert.deepEqual(recovery.body, emptyEvidence);
-    assert.equal(fetchMock.mock.callCount(), 1);
+    assert.equal(fetchMock.mock.callCount(), 2);
   });
 }
 
@@ -214,17 +229,18 @@ for (const { name, respond, status, errorCode } of [
 ]) {
   test(`evidence route propagates ${name} without file reads and recovers`, async (t) => {
     let fail = true;
-    const fetchMock = t.mock.method(globalThis, "fetch", async () => fail ? respond() : evidenceTree());
+    const fetchMock = t.mock.method(globalThis, "fetch", async (input: Parameters<typeof fetch>[0]) =>
+      String(input).includes("/commits/") ? evidenceResolution() : fail ? respond() : evidenceTree());
     const request = await startServer(t);
     const response = await request(evidenceSuffix, evidencePost);
     assert.equal(response.status, status);
     assert.deepEqual(response.body, { error: errorCode });
-    assert.equal(fetchMock.mock.callCount(), 1);
+    assert.equal(fetchMock.mock.callCount(), 2);
     fail = false;
     const recovery = await request(evidenceSuffix, evidencePost);
     assert.equal(recovery.status, 200);
     assert.deepEqual(recovery.body, emptyEvidence);
-    assert.equal(fetchMock.mock.callCount(), 2);
+    assert.equal(fetchMock.mock.callCount(), 4);
   });
 }
 
@@ -240,6 +256,7 @@ for (const { name, respond, status, errorCode } of [
     t.mock.method(globalThis, "fetch", async (input: Parameters<typeof fetch>[0]) => {
       const url = String(input);
       urls.push(url);
+      if (url.includes("/commits/")) return evidenceResolution();
       if (url.includes("/git/trees/")) return evidenceTree(["login-a.ts", "login-b.ts", "login-c.ts"]);
       if (fail && url.includes("/contents/login-b.ts")) return respond();
       const path = new URL(url).pathname.split("/contents/")[1];
@@ -250,9 +267,9 @@ for (const { name, respond, status, errorCode } of [
     const response = await request(evidenceSuffix, evidencePost);
     assert.equal(response.status, status);
     assert.deepEqual(response.body, { error: errorCode });
-    assert.equal(urls.length, 3);
-    assert.ok(urls[1]?.includes("/contents/login-a.ts"));
-    assert.ok(urls[2]?.includes("/contents/login-b.ts"));
+    assert.equal(urls.length, 4);
+    assert.ok(urls[2]?.includes("/contents/login-a.ts"));
+    assert.ok(urls[3]?.includes("/contents/login-b.ts"));
     fail = false;
     const recovery = await request(evidenceSuffix, evidencePost);
     assert.equal(recovery.status, 200);
@@ -261,7 +278,36 @@ for (const { name, respond, status, errorCode } of [
         name: path, path, sha: "fixture-blob-sha", content: "export const login = true;",
         score: 1, matchedTerms: ["login"],
       })) });
-    assert.equal(urls.length, 7);
+    assert.equal(urls.length, 9);
+  });
+}
+
+for (const { name, respond, status, errorCode } of [
+  { name: "missing ref", respond: () => new Response(null, { status: 404 }), status: 404, errorCode: "REPOSITORY_OR_REF_NOT_FOUND" },
+  { name: "resolution upstream failure", respond: () => new Response(null, { status: 503 }), status: 502, errorCode: "GITHUB_REQUEST_FAILED" },
+  { name: "malformed resolution", respond: () => Response.json({ sha: evidenceCommitSha }), status: 502, errorCode: "GITHUB_REQUEST_FAILED" },
+]) {
+  test(`evidence route stops before discovery on ${name} and recovers`, async (t) => {
+    let fail = true;
+    const urls: string[] = [];
+    t.mock.method(globalThis, "fetch", async (input: Parameters<typeof fetch>[0]) => {
+      const url = String(input);
+      urls.push(url);
+      if (url.includes("/commits/")) return fail ? respond() : evidenceResolution();
+      return evidenceTree();
+    });
+    const request = await startServer(t);
+    const response = await request(evidenceSuffix, evidencePost);
+    assert.equal(response.status, status);
+    assert.deepEqual(response.body, { error: errorCode });
+    const base = "https://api.github.com/repos/example-owner/demo";
+    assert.deepEqual(urls, [`${base}/commits/main?per_page=1`]);
+    fail = false;
+    const recovery = await request(evidenceSuffix, evidencePost);
+    assert.equal(recovery.status, 200);
+    assert.deepEqual(recovery.body, emptyEvidence);
+    assert.deepEqual(urls, [`${base}/commits/main?per_page=1`, `${base}/commits/main?per_page=1`,
+      `${base}/git/trees/${evidenceTreeSha}?recursive=1`]);
   });
 }
 
