@@ -4,7 +4,7 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "test": "node --import tsx --test src/github.test.ts src/app.test.ts src/retrieval.test.ts src/investigation.test.ts src/contentRetrieval.test.ts eval/content-retrieval.test.mjs",
+    "test": "node --import tsx --test src/github.test.ts src/app.test.ts src/retrieval.test.ts src/investigation.test.ts src/contentRetrieval.test.ts src/dependencies.test.ts eval/content-retrieval.test.mjs",
     "dev": "tsx watch src/server.ts",
     "typecheck": "tsc --noEmit"
   },
